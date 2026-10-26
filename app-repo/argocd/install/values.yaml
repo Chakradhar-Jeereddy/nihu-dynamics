@@ -1,0 +1,48 @@
+global:
+  domain: argocd.example.com
+
+server:
+  replicas: 1
+
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+      alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_ACM_CERT_ARN"
+      alb.ingress.kubernetes.io/backend-protocol: HTTPS
+      alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    hosts:
+      - argocd.example.com
+
+  extraArgs:
+    - --insecure
+
+configs:
+  params:
+    server.insecure: true
+
+  rbac:
+    policy.default: role:readonly
+    policy.csv: |
+      g, admins, role:admin
+
+  repositories:
+    app-repo:
+      url: https://github.com/REPLACE_ORG/app-repo.git
+      name: app-repo
+      type: git
+
+controller:
+  replicas: 1
+
+repoServer:
+  replicas: 1
+
+applicationSet:
+  replicas: 1
+
+notifications:
+  enabled: false

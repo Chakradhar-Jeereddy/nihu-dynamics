@@ -1,0 +1,94 @@
+expose:
+  type: ingress
+  tls:
+    enabled: true
+    certSource: secret
+    secret:
+      secretName: harbor-tls
+  ingress:
+    hosts:
+      core: harbor.example.com
+    className: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+      alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_ACM_CERT_ARN"
+      alb.ingress.kubernetes.io/backend-protocol: HTTPS
+
+externalURL: https://harbor.example.com
+
+persistence:
+  enabled: true
+  resourcePolicy: "keep"
+  persistentVolumeClaim:
+    registry:
+      storageClass: gp3
+      size: 50Gi
+    jobservice:
+      jobLog:
+        storageClass: gp3
+        size: 5Gi
+    database:
+      storageClass: gp3
+      size: 5Gi
+    redis:
+      storageClass: gp3
+      size: 5Gi
+    trivy:
+      storageClass: gp3
+      size: 5Gi
+
+  imageChartStorage:
+    type: s3
+    s3:
+      region: us-east-1
+      bucket: REPLACE_WITH_HARBOR_BUCKET_NAME
+      regionendpoint: s3.us-east-1.amazonaws.com
+
+harborAdminPassword: "REPLACE_WITH_SECURE_PASSWORD"
+
+registry:
+  serviceAccountName: harbor-registry
+  serviceAccount:
+    create: true
+    annotations:
+      eks.amazonaws.com/role-arn: REPLACE_WITH_HARBOR_ROLE_ARN
+
+core:
+  replicas: 1
+
+portal:
+  replicas: 1
+
+jobservice:
+  replicas: 1
+
+trivy:
+  enabled: true
+  replicas: 1
+
+database:
+  type: internal
+
+redis:
+  type: internal
+
+metrics:
+  enabled: true
+  core:
+    path: /metrics
+    port: 8001
+  registry:
+    path: /metrics
+    port: 8001
+  jobservice:
+    path: /metrics
+    port: 8001
+  exporter:
+    path: /metrics
+    port: 8001
+  serviceMonitor:
+    enabled: true
+    additionalLabels:
+      release: monitoring

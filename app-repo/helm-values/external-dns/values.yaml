@@ -1,0 +1,35 @@
+provider:
+  name: aws
+
+env:
+  - name: AWS_DEFAULT_REGION
+    value: us-east-1
+
+serviceAccount:
+  create: true
+  name: external-dns
+  annotations:
+    eks.amazonaws.com/role-arn: REPLACE_WITH_EXTERNAL_DNS_ROLE_ARN
+
+domainFilters:
+  - example.com
+
+policy: upsert-only
+
+txtOwnerId: nihu-dynamics-dev
+
+sources:
+  - ingress
+  - service
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: monitoring

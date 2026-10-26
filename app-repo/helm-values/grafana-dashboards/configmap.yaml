@@ -1,0 +1,103 @@
+# ArgoCD syncs this folder as raw manifests.
+# Each dashboard JSON file is wrapped in its own ConfigMap below.
+# The Grafana sidecar picks up ConfigMaps with label grafana_dashboard: "1".
+#
+# Dashboard JSON files live beside this YAML. To add a new dashboard:
+#   1. Drop the .json file in this directory
+#   2. Add a ConfigMap entry below referencing it
+#   3. Commit — ArgoCD auto-syncs the change
+#
+# NOTE: Because ArgoCD syncs plain manifests (not Helm), the JSON must be
+# pasted inline under the data key. Keep the JSON files as the source of
+# truth and copy their contents here during updates.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-cluster-overview
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Kubernetes"
+data:
+  cluster-overview.json: |
+    SEE_cluster-overview.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-node-metrics
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Kubernetes"
+data:
+  node-metrics.json: |
+    SEE_node-metrics.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-pod-metrics
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Kubernetes"
+data:
+  pod-metrics.json: |
+    SEE_pod-metrics.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-namespace-resources
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Kubernetes"
+data:
+  namespace-resources.json: |
+    SEE_namespace-resources.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-network-monitoring
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Network"
+data:
+  network-monitoring.json: |
+    SEE_network-monitoring.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-latency-errors
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "SLO"
+data:
+  latency-errors.json: |
+    SEE_latency-errors.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-harbor-overview
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Harbor"
+data:
+  harbor-overview.json: |
+    SEE_harbor-overview.json

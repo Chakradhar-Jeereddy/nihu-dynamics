@@ -1,0 +1,17 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Helm
+charts/
+*.tgz
+
+# Secrets (never commit actual secret values)
+*-secret.yaml
+!*-secret.yaml.example

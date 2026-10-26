@@ -1,0 +1,29 @@
+clusterName: nihu-dynamics-dev
+
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller
+  annotations:
+    eks.amazonaws.com/role-arn: REPLACE_WITH_LB_CONTROLLER_ROLE_ARN
+
+region: us-east-1
+vpcId: REPLACE_WITH_VPC_ID
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: monitoring
+
+defaultTags:
+  Project: nihu-dynamics
+  Environment: dev
+  ManagedBy: aws-lb-controller
