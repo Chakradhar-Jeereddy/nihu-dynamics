@@ -1,0 +1,534 @@
+# Harbor PostgreSQL Investigation: Scanning, Connections & Blob Cleanup
+
+## Context
+
+Harbor's internal PostgreSQL frequently hits issues at scale:
+- **Scanning failures** — Trivy scan jobs pile up, exhaust DB connections
+- **Max connections exceeded** — the default `max_connections = 100` is too low when core, jobservice, trivy, and registry all share one Postgres
+- **Blob accumulation** — deleted image tags leave behind unlinked blobs; a cleanup/GC job has been started and we need to verify it's working
+
+---
+
+## 1. Get a Shell into the Harbor PostgreSQL Pod
+
+```bash
+# Find the database pod
+kubectl get pods -n harbor -l component=database
+
+# Exec into it
+kubectl exec -it -n harbor <harbor-database-pod> -- bash
+
+# Connect to the registry database
+psql -U postgres -d registry
+```
+
+Or connect directly:
+```bash
+kubectl exec -it -n harbor <harbor-database-pod> -- psql -U postgres -d registry
+```
+
+---
+
+## 2. Check Current Connection Pressure
+
+### Active connections vs limit
+```sql
+-- Current max allowed
+SHOW max_connections;
+
+-- Active connections right now
+SELECT count(*) FROM pg_stat_activity;
+
+-- Connections by state
+SELECT state, count(*)
+FROM pg_stat_activity
+GROUP BY state
+ORDER BY count DESC;
+
+-- Connections by application/client (shows which Harbor component is hogging)
+SELECT application_name, state, count(*)
+FROM pg_stat_activity
+GROUP BY application_name, state
+ORDER BY count DESC;
+
+-- Long-running queries (potential blockers)
+SELECT pid, now() - pg_stat_activity.query_start AS duration,
+       query, state, application_name
+FROM pg_stat_activity
+WHERE (now() - pg_stat_activity.query_start) > interval '30 seconds'
+  AND state != 'idle'
+ORDER BY duration DESC;
+```
+
+### Kill stuck connections if needed
+```sql
+-- Cancel a query gracefully
+SELECT pg_cancel_backend(<pid>);
+
+-- Terminate a connection forcefully (last resort)
+SELECT pg_terminate_backend(<pid>);
+```
+
+---
+
+## 3. Investigate Scanning Issues
+
+### Check scan job status in Harbor
+```sql
+-- Scan job queue and status
+SELECT id, status, status_code, creation_time, update_time
+FROM task
+WHERE execution_id IN (
+    SELECT id FROM execution WHERE vendor_type = 'SCAN'
+)
+ORDER BY creation_time DESC
+LIMIT 50;
+
+-- Count scan jobs by status
+SELECT status, count(*)
+FROM task
+WHERE execution_id IN (
+    SELECT id FROM execution WHERE vendor_type = 'SCAN'
+)
+GROUP BY status;
+
+-- Stuck/pending scan executions
+SELECT id, vendor_type, status, trigger, start_time, end_time
+FROM execution
+WHERE vendor_type = 'SCAN'
+  AND status IN ('Running', 'Pending', 'Scheduled')
+ORDER BY start_time DESC;
+
+-- Failed scans in the last 24h
+SELECT id, status, status_code, status_message, creation_time
+FROM task
+WHERE execution_id IN (
+    SELECT id FROM execution WHERE vendor_type = 'SCAN'
+)
+  AND status = 'Error'
+  AND creation_time > now() - interval '24 hours'
+ORDER BY creation_time DESC
+LIMIT 20;
+```
+
+### Clean up stuck scan jobs
+```sql
+-- Mark stale Running/Pending scan tasks as Error (older than 2 hours)
+UPDATE task SET status = 'Error', status_message = 'Manually cleaned - stuck'
+WHERE status IN ('Running', 'Pending')
+  AND creation_time < now() - interval '2 hours'
+  AND execution_id IN (
+    SELECT id FROM execution WHERE vendor_type = 'SCAN'
+  );
+
+-- Also update the parent executions
+UPDATE execution SET status = 'Error'
+WHERE vendor_type = 'SCAN'
+  AND status IN ('Running', 'Pending')
+  AND start_time < now() - interval '2 hours';
+```
+
+---
+
+## 4. Monitor the Blob Cleanup / Garbage Collection Job
+
+### Key tables to watch
+
+| Table | What it holds | Shrinks during GC? |
+|-------|--------------|---------------------|
+| `blob` | All registry blobs (layers, configs) | Yes — unlinked blobs get deleted |
+| `artifact_blob` | Links artifacts to their blobs | Yes — stale links removed |
+| `artifact` | Image manifests/artifacts | Yes — if tags were deleted |
+| `artifact_trash` | Artifacts marked for deletion | Grows first, then empties |
+| `project_blob` | Per-project blob references | Yes |
+| `task` | Job/task records (scan, GC, replication) | Old completed tasks accumulate |
+| `execution` | Parent execution records | Old completed executions accumulate |
+
+### Check table sizes (run periodically to track shrinkage)
+```sql
+-- Table sizes sorted by size
+SELECT
+    schemaname || '.' || relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    pg_size_pretty(pg_relation_size(relid)) AS data_size,
+    pg_size_pretty(pg_total_relation_size(relid) - pg_relation_size(relid)) AS index_size,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows
+FROM pg_stat_user_tables
+ORDER BY pg_total_relation_size(relid) DESC
+LIMIT 20;
+
+-- Just the key Harbor tables
+SELECT
+    relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows
+FROM pg_stat_user_tables
+WHERE relname IN ('blob', 'artifact_blob', 'artifact', 'artifact_trash',
+                  'project_blob', 'task', 'execution', 'scan_report')
+ORDER BY pg_total_relation_size(relid) DESC;
+```
+
+### Track blob cleanup progress
+```sql
+-- Total blobs vs unlinked blobs (blobs with no artifact reference)
+SELECT
+    (SELECT count(*) FROM blob) AS total_blobs,
+    (SELECT count(*) FROM blob
+     WHERE id NOT IN (SELECT blob_id FROM artifact_blob)) AS orphan_blobs;
+
+-- Artifacts in trash (waiting to be cleaned)
+SELECT count(*) FROM artifact_trash;
+
+-- Blob count over time — run this every 10-15 min to see if count drops
+SELECT count(*) AS blob_count, pg_size_pretty(sum(size)) AS total_blob_size
+FROM blob;
+
+-- Recently deleted blobs (if GC is working, this query returns fewer results over time)
+SELECT count(*) FROM artifact_blob
+WHERE artifact_id NOT IN (SELECT id FROM artifact);
+```
+
+### Check the GC execution status
+```sql
+-- GC job executions
+SELECT id, vendor_type, status, trigger, start_time, end_time,
+       end_time - start_time AS duration
+FROM execution
+WHERE vendor_type = 'GARBAGE_COLLECTION'
+ORDER BY start_time DESC
+LIMIT 10;
+
+-- GC tasks detail
+SELECT t.id, t.status, t.status_code, t.status_message,
+       t.creation_time, t.update_time,
+       t.update_time - t.creation_time AS duration
+FROM task t
+JOIN execution e ON t.execution_id = e.id
+WHERE e.vendor_type = 'GARBAGE_COLLECTION'
+ORDER BY t.creation_time DESC
+LIMIT 10;
+```
+
+---
+
+## 5. Clean Up Old Job Records (the `task` and `execution` tables bloat)
+
+```sql
+-- How many old task/execution records exist
+SELECT
+    (SELECT count(*) FROM task) AS total_tasks,
+    (SELECT count(*) FROM task WHERE creation_time < now() - interval '30 days') AS old_tasks,
+    (SELECT count(*) FROM execution) AS total_executions,
+    (SELECT count(*) FROM execution WHERE start_time < now() - interval '30 days') AS old_executions;
+
+-- Delete old completed tasks (> 30 days)
+DELETE FROM task
+WHERE status IN ('Success', 'Error', 'Stopped')
+  AND creation_time < now() - interval '30 days';
+
+-- Delete old completed executions (> 30 days)
+DELETE FROM execution
+WHERE status IN ('Success', 'Error', 'Stopped')
+  AND start_time < now() - interval '30 days';
+
+-- VACUUM after large deletes to reclaim space
+VACUUM ANALYZE task;
+VACUUM ANALYZE execution;
+```
+
+---
+
+## 6. Database Health & Space Reclamation
+
+```sql
+-- Overall database size
+SELECT pg_size_pretty(pg_database_size('registry')) AS db_size;
+
+-- Check for bloat (dead tuples needing VACUUM)
+SELECT relname, n_dead_tup, n_live_tup,
+       round(n_dead_tup::numeric / greatest(n_live_tup, 1) * 100, 2) AS dead_pct
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;
+
+-- Run VACUUM on bloated tables
+VACUUM ANALYZE blob;
+VACUUM ANALYZE artifact_blob;
+VACUUM ANALYZE artifact;
+VACUUM ANALYZE scan_report;
+
+-- Full vacuum (locks table but reclaims disk space to OS — use during maintenance)
+-- VACUUM FULL blob;
+```
+
+---
+
+## 7. Recommended Monitoring Approach
+
+**While the cleanup job runs, execute this sequence every 10-15 minutes:**
+
+```sql
+-- Snapshot query — run repeatedly and compare
+SELECT
+    now() AS checked_at,
+    (SELECT count(*) FROM blob) AS blob_count,
+    (SELECT pg_size_pretty(sum(size)) FROM blob) AS blob_total_size,
+    (SELECT count(*) FROM artifact_trash) AS trash_count,
+    (SELECT count(*) FROM artifact_blob) AS artifact_blob_links,
+    (SELECT pg_size_pretty(pg_database_size('registry'))) AS db_size,
+    (SELECT count(*) FROM pg_stat_activity) AS active_connections;
+```
+
+**What to look for:**
+- `blob_count` should decrease over time
+- `trash_count` should go to 0 (artifacts fully cleaned)
+- `db_size` may not shrink until you run `VACUUM FULL` (regular VACUUM marks space reusable but doesn't return it to OS)
+- `active_connections` should stay well under `max_connections`
+
+---
+
+## 8. Quick Fixes for Max Connections
+
+If you can't change Postgres config immediately:
+
+```bash
+# Check current setting from outside
+kubectl exec -it -n harbor <db-pod> -- psql -U postgres -c "SHOW max_connections;"
+
+# Increase via postgresql.conf (requires restart)
+kubectl exec -it -n harbor <db-pod> -- bash -c \
+  "echo 'max_connections = 300' >> /var/lib/postgresql/data/postgresql.conf"
+
+# Restart the database pod
+kubectl delete pod -n harbor <db-pod>
+```
+
+For a permanent fix, set in Harbor Helm values:
+```yaml
+database:
+  type: internal
+  internal:
+    # Add to extraEnvVars or via a custom postgresql.conf
+    password: "..."
+```
+
+Or better, tune Harbor components to use fewer connections via `core` and `jobservice` environment variables.
+
+---
+
+## 9. S3 Blob Cleanup (Storage-Side)
+
+Harbor's GC has two phases: **DB cleanup** (removes metadata) and **blob deletion from storage** (removes the actual layers from S3). If the GC ran with `--delete-untagged` but the S3 blobs weren't purged, they stay on disk/S3 consuming storage.
+
+### Check S3 bucket size and object count
+```bash
+# Total size and object count
+aws s3 ls s3://<harbor-bucket-name> --recursive --summarize | tail -3
+
+# Size by top-level prefix (docker/registry/v2/blobs vs repositories)
+aws s3 ls s3://<harbor-bucket-name>/docker/registry/v2/blobs/ --recursive --summarize | tail -3
+aws s3 ls s3://<harbor-bucket-name>/docker/registry/v2/repositories/ --recursive --summarize | tail -3
+```
+
+### CloudWatch metrics (if enabled)
+```bash
+# Bucket-level metrics (requires S3 request metrics or Storage Lens)
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/S3 \
+  --metric-name BucketSizeBytes \
+  --dimensions Name=BucketName,Value=<harbor-bucket-name> Name=StorageType,Value=StandardStorage \
+  --start-time $(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 86400 \
+  --statistics Average
+
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/S3 \
+  --metric-name NumberOfObjects \
+  --dimensions Name=BucketName,Value=<harbor-bucket-name> Name=StorageType,Value=AllStorageTypes \
+  --start-time $(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 86400 \
+  --statistics Average
+```
+
+### Find orphan blobs in S3 (blobs on S3 but not in DB)
+
+After DB GC completes, cross-reference what's in S3 vs what the DB still references:
+
+```bash
+# List all blob digests in S3
+aws s3 ls s3://<harbor-bucket-name>/docker/registry/v2/blobs/sha256/ --recursive \
+  | awk '{print $4}' | grep '/data$' \
+  | sed 's|docker/registry/v2/blobs/sha256/||;s|/data$||;s|/||' \
+  | sort > /tmp/s3_blobs.txt
+
+# Count
+wc -l /tmp/s3_blobs.txt
+```
+
+Then from inside the DB pod:
+```sql
+-- Export DB blob digests
+\copy (SELECT digest FROM blob) TO '/tmp/db_blobs.txt'
+```
+
+```bash
+# Compare — blobs in S3 but NOT in DB are orphans
+comm -23 /tmp/s3_blobs.txt <(sort /tmp/db_blobs.txt) > /tmp/orphan_blobs.txt
+wc -l /tmp/orphan_blobs.txt
+```
+
+### Harbor registry garbage-collect (the storage-side GC)
+
+Harbor's GC via the API/UI handles both DB and storage. But if you need to force the storage-side cleanup, the registry itself has a built-in GC:
+
+```bash
+# Exec into the registry pod
+kubectl exec -it -n harbor <harbor-registry-pod> -- sh
+
+# Dry run first — shows what would be deleted
+registry garbage-collect /etc/registry/config.yml --dry-run
+
+# Actual delete
+registry garbage-collect /etc/registry/config.yml --delete-untagged
+```
+
+### Add S3 lifecycle rule to auto-expire incomplete uploads
+
+Multipart uploads that fail leave orphan fragments. Add a lifecycle rule:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket <harbor-bucket-name> \
+  --lifecycle-configuration '{
+    "Rules": [
+      {
+        "ID": "AbortIncompleteMultipartUploads",
+        "Status": "Enabled",
+        "Filter": {},
+        "AbortIncompleteMultipartUpload": {
+          "DaysAfterInitiation": 3
+        }
+      }
+    ]
+  }'
+```
+
+### Check for incomplete multipart uploads
+```bash
+aws s3api list-multipart-uploads --bucket <harbor-bucket-name>
+```
+
+### Monitor S3 storage reduction over time
+```bash
+# Quick size check script — run before and after GC
+echo "=== $(date) ===" >> /tmp/harbor_s3_sizes.log
+aws s3 ls s3://<harbor-bucket-name> --recursive --summarize \
+  | tail -3 >> /tmp/harbor_s3_sizes.log
+```
+
+---
+
+## 10. Additional Diagnostic Queries
+
+### Per-project blob usage (find which projects consume most space)
+```sql
+SELECT p.name AS project_name,
+       count(pb.blob_id) AS blob_count,
+       pg_size_pretty(sum(b.size)) AS total_size
+FROM project_blob pb
+JOIN blob b ON pb.blob_id = b.id
+JOIN project p ON pb.project_id = p.project_id
+GROUP BY p.name
+ORDER BY sum(b.size) DESC;
+```
+
+### Per-repository artifact count (find repos with most images)
+```sql
+SELECT r.name AS repository_name,
+       count(a.id) AS artifact_count,
+       min(a.push_time) AS oldest_push,
+       max(a.push_time) AS newest_push
+FROM artifact a
+JOIN repository r ON a.repository_id = r.repository_id
+GROUP BY r.name
+ORDER BY artifact_count DESC
+LIMIT 20;
+```
+
+### Largest blobs (find oversized layers)
+```sql
+SELECT digest, pg_size_pretty(size) AS blob_size, creation_time
+FROM blob
+ORDER BY size DESC
+LIMIT 20;
+```
+
+### Scan report bloat (vulnerability data accumulates fast)
+```sql
+SELECT
+    pg_size_pretty(pg_total_relation_size('scan_report')) AS scan_report_size,
+    count(*) AS total_reports,
+    count(*) FILTER (WHERE create_time < now() - interval '30 days') AS old_reports
+FROM scan_report;
+
+-- Delete old scan reports (> 30 days, artifacts may have been rescanned since)
+DELETE FROM scan_report
+WHERE create_time < now() - interval '30 days';
+
+VACUUM ANALYZE scan_report;
+```
+
+### Index health check
+```sql
+SELECT indexrelname, idx_scan, idx_tup_read, idx_tup_fetch,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_stat_user_indexes
+WHERE schemaname = 'public'
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 20;
+```
+
+### Lock contention (if GC seems stuck)
+```sql
+SELECT blocked_locks.pid AS blocked_pid,
+       blocked_activity.usename AS blocked_user,
+       blocking_locks.pid AS blocking_pid,
+       blocking_activity.usename AS blocking_user,
+       blocked_activity.query AS blocked_statement,
+       blocking_activity.query AS blocking_statement
+FROM pg_catalog.pg_locks blocked_locks
+JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_catalog.pg_locks blocking_locks
+    ON blocking_locks.locktype = blocked_locks.locktype
+    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+    AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+    AND blocking_locks.pid != blocked_locks.pid
+JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+WHERE NOT blocked_locks.granted;
+```
+
+---
+
+## 11. Investigation Sequence (Step-by-Step)
+
+1. **Connect** to the Harbor PostgreSQL pod (Section 1)
+2. **Assess connections** — run Section 2 queries to check if max_connections is the bottleneck
+3. **Check GC status** — run Section 4 GC execution queries to confirm the job is running/completed
+4. **Baseline snapshot** — run the Section 7 snapshot query and note the numbers
+5. **Check table sizes** — run Section 4 table size queries
+6. **Wait 10-15 min**, re-run the snapshot query — compare blob_count and trash_count
+7. **Check scanning** — run Section 3 queries to find stuck/failed scans
+8. **Check S3** — run Section 9 bucket size commands
+9. **After GC completes** — clean old job records (Section 5), vacuum (Section 6), verify S3 reduction (Section 9)
+10. **If space didn't shrink** — run `VACUUM FULL` on large tables during a maintenance window
